@@ -11,13 +11,22 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.util.asJsoup
+import eu.kanade.tachiyomi.util.parseAs
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.decodeFromStream
+import okhttp3.FormBody
+import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import uy.kohesive.injekt.injectLazy
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -34,6 +43,8 @@ class Anitube : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
     private val preferences by lazy {
         Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
     }
+
+    private val json: Json by injectLazy()
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", baseUrl)
@@ -145,17 +156,78 @@ class Anitube : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
     override fun episodeFromElement(element: Element) = SEpisode.create().apply {
         setUrlWithoutDomain(element.attr("href"))
         episode_number = element.selectFirst("div.animepag_episodios_item_views")!!
-            .text()
+            .text().trim()
             .substringAfter(" ")
             .toFloatOrNull() ?: 0F
-        name = element.selectFirst("div.animepag_episodios_item_nome")!!.text()
+        name = element.selectFirst("div[class*='animepag_episodios_item_views']")!!.text()
         date_upload = element.selectFirst("div.animepag_episodios_item_date")!!
             .text()
             .toDate()
     }
 
     // ============================ Video Links =============================
-    override fun videoListParse(response: Response) = AnitubeExtractor.getVideoList(response, headers)
+    override fun videoListParse(response: Response) = AnitubeExtractor.getVideoList(response, headers).let {
+        val auth = getToken()
+
+        it.map { video ->
+            Video(
+                url = video.url,
+                quality = video.quality,
+                videoUrl = "${video.videoUrl}${auth.value}",
+                headers = video.headers,
+                subtitleTracks = video.subtitleTracks,
+                audioTracks = video.audioTracks,
+            )
+        }
+    }
+
+    private fun getToken(): AnituteToken {
+        val headers = Headers.Builder()
+            .set("Accept", "*/*")
+            .set("Accept-Encoding", "br, zstd")
+            .set("Accept-Language", "pt-BR,en-US;q=0.7,en;q=0.3")
+            .set("Cache-Control", "no-cache")
+            .set("Connection", "keep-alive")
+            .set("Pragma", "no-cache")
+            .set("Referer", "$baseUrl/")
+            .set("Sec-Fetch-Dest", "empty")
+            .set("Sec-Fetch-Mode", "cors")
+            .set("Sec-Fetch-Site", "same-site")
+            .apply {
+                headers["User-Agent"]?.let {
+                    set("User-Agent", it)
+                }
+            }
+            .build()
+
+        val form = FormBody.Builder()
+            .add("category", "client")
+            .add("type", "premium")
+            .add("ad", "window.isAdblockActive = false;")
+            .build()
+
+        val client = OkHttpClient()
+
+        val response = client
+            .newCall(POST(url = "https://ads.anitube.vip", headers = headers, body = form))
+            .execute()
+
+        val token = response.parseAs<List<AnituteToken>>().first()
+
+        val tokenUrl = "https://ads.anitube.vip".toHttpUrl().newBuilder()
+            .addQueryParameter("token", token.value)
+            .build()
+
+        return client.newCall(GET(tokenUrl, headers))
+            .execute()
+            .parseAs<List<AnituteToken>>()
+            .first()
+    }
+
+    private inline fun <reified T> Response.parseAs(): T = use {
+        json.decodeFromStream(it.body.byteStream())
+    }
+
     override fun videoListSelector() = throw UnsupportedOperationException()
     override fun videoFromElement(element: Element) = throw UnsupportedOperationException()
     override fun videoUrlParse(document: Document) = throw UnsupportedOperationException()
